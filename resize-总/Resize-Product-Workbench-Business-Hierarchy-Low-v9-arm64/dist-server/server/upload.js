@@ -1,0 +1,22 @@
+import sharp from "sharp";
+import { AppError } from "./errors.js";
+import { POLICY } from "../shared/policy.js";
+const signatures = { png: (b) => b.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])), jpeg: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff, webp: (b) => b.subarray(0, 4).toString() === "RIFF" && b.subarray(8, 12).toString() === "WEBP" };
+export async function inspectUpload(data) { if (data.length > POLICY.maxUploadBytes)
+    throw new AppError("UPLOAD_TOO_LARGE"); const signature = Object.entries(signatures).find(([, f]) => f(data))?.[0]; if (!signature)
+    throw new AppError("UNSUPPORTED_IMAGE_SIGNATURE"); try {
+    const m = await sharp(data, { failOn: "error", limitInputPixels: POLICY.maxPixels, animated: false }).metadata();
+    if (m.pages && m.pages > 1)
+        throw new AppError("MULTIFRAME_NOT_ALLOWED");
+    if (!m.width || !m.height || m.width > POLICY.maxEdge || m.height > POLICY.maxEdge || m.width * m.height > POLICY.maxPixels)
+        throw new AppError("IMAGE_DIMENSIONS_REJECTED");
+    if (m.format !== signature)
+        throw new AppError("IMAGE_SIGNATURE_MISMATCH");
+    await sharp(data, { failOn: "error", limitInputPixels: POLICY.maxPixels }).toBuffer();
+    return { format: m.format, width: m.width, height: m.height };
+}
+catch (e) {
+    if (e instanceof AppError)
+        throw e;
+    throw new AppError("IMAGE_DECODE_FAILED");
+} }

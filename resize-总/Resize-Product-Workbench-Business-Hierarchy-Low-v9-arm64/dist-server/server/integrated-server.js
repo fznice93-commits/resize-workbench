@@ -1,0 +1,192 @@
+import http from "node:http";
+import { readFile } from "node:fs/promises";
+import { extname, join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { AppError, safeDetail } from "./errors.js";
+import { BUILD_ID, POLICY_HASH, POLICY } from "../shared/policy.js";
+import { ProductionFlow } from "./production-flow.js";
+import { BatchFlow } from "./batch-flow.js";
+import { planSize } from "./size-plan.js";
+const MAX_BODY = POLICY.maxUploadBytes + 1024;
+async function body(req, max = MAX_BODY) { const chunks = []; let total = 0; for await (const c of req) {
+    total += c.length;
+    if (total > max)
+        throw new AppError("REQUEST_TOO_LARGE");
+    chunks.push(Buffer.from(c));
+} return Buffer.concat(chunks); }
+function json(res, status, value) { res.statusCode = status; res.setHeader("content-type", "application/json; charset=utf-8"); res.setHeader("cache-control", "no-store"); res.end(JSON.stringify(value)); }
+function cookie(req, name) { return req.headers.cookie?.split(";").map(x => x.trim().split("=", 2)).find(x => x[0] === name)?.[1]; }
+export function createIntegratedServer(runtime, options) {
+    const session = randomBytes(32).toString("hex"), keyStorageMode = options.keyStorageMode || "MEMORY_DEMO", keySetupOnly = options.keySetupOnly === true, productMode = options.productMode ?? (keySetupOnly ? "KEY_SETUP" : "DEMO"), formalMode = productMode === "PRODUCTION_PREVIEW" || productMode === "PRODUCTION", providerEnabled = productMode === "PRODUCTION", flow = new ProductionFlow(runtime, session), batchFlow = new BatchFlow(runtime, session), server = http.createServer(async (req, res) => {
+        try {
+            const address = server.address();
+            if (!address || typeof address === "string")
+                throw new AppError("SERVER_NOT_READY");
+            const expectedHost = `127.0.0.1:${address.port}`, origin = `http://${expectedHost}`;
+            if (req.headers.host !== expectedHost)
+                throw new AppError("HOST_REJECTED", "HOST_REJECTED", 403);
+            const method = req.method || "GET", url = new URL(req.url || "/", origin), mutation = !(method === "GET" || method === "HEAD"), browser = req.headers.origin === origin && cookie(req, "resize_session") === session, script = !req.headers.origin && req.headers["x-instance-token"] === options.instanceToken;
+            if (mutation && !browser && !script)
+                throw new AppError("ORIGIN_REJECTED", "ORIGIN_REJECTED", 403);
+            if (method === "GET" && url.pathname === "/api/health") {
+                if (req.headers["x-instance-token"] !== options.instanceToken)
+                    throw new AppError("INSTANCE_TOKEN_REQUIRED", "INSTANCE_TOKEN_REQUIRED", 403);
+                return json(res, 200, { ok: true, buildId: BUILD_ID, policyHash: POLICY_HASH, promptGate: "PASS", promptVersion: "FROZEN_v1.1", keyStorageMode, keySetupOnly, productMode, providerPolicy: providerEnabled ? "enabled" : "disabled", model: POLICY.model, quality: POLICY.quality, instanceTokenSummary: options.instanceToken.slice(0, 8) });
+            }
+            if (method === "GET" && url.pathname === "/api/key-status")
+                return json(res, 200, { ...(await runtime.keyStatus()), keyStorageMode, keySetupOnly, ...(keySetupOnly ? {} : { productMode }), networkValidated: false, providerEnabled });
+            if (method === "POST" && url.pathname === "/api/key") {
+                if (productMode === "PRODUCTION")
+                    throw new AppError("KEY_MUTATION_UNAVAILABLE", "KEY_MUTATION_UNAVAILABLE", 409);
+                if (!String(req.headers["content-type"] || "").startsWith("application/json"))
+                    throw new AppError("CONTENT_TYPE_REJECTED");
+                const value = JSON.parse((await body(req, 8192)).toString());
+                await runtime.saveKey(String(value.key || ""));
+                return json(res, 200, { configured: true, keyStorageMode });
+            }
+            if (method === "DELETE" && url.pathname === "/api/key") {
+                if (productMode === "PRODUCTION")
+                    throw new AppError("KEY_MUTATION_UNAVAILABLE", "KEY_MUTATION_UNAVAILABLE", 409);
+                await runtime.deleteKey();
+                return json(res, 200, { configured: false, keyStorageMode });
+            }
+            if (method === "GET" && url.pathname === "/api/jobs")
+                return json(res, 200, { jobs: runtime.list() });
+            if (method === "POST" && url.pathname === "/api/jobs") {
+                if (keySetupOnly)
+                    throw new AppError("KEY_SETUP_ONLY", "KEY_SETUP_ONLY", 409);
+                if (req.headers["content-type"] !== "application/octet-stream")
+                    throw new AppError("CONTENT_TYPE_REJECTED");
+                return json(res, 201, await runtime.createJob(await body(req), Number(req.headers["x-target-width"]), Number(req.headers["x-target-height"]), String(req.headers["x-display-name"] || "image")));
+            }
+            if (method === "POST" && url.pathname === "/api/batches") {
+                if (keySetupOnly)
+                    throw new AppError("KEY_SETUP_ONLY", "KEY_SETUP_ONLY", 409);
+                if (req.headers["content-type"] !== "application/octet-stream")
+                    throw new AppError("CONTENT_TYPE_REJECTED");
+                const idempotencyKey = String(req.headers["x-idempotency-key"] || "");
+                if (!/^[A-Za-z0-9_-]{16,128}$/.test(idempotencyKey))
+                    throw new AppError("IDEMPOTENCY_KEY_REJECTED");
+                let targets;
+                try {
+                    targets = JSON.parse(String(req.headers["x-target-sizes"] || ""));
+                }
+                catch {
+                    throw new AppError("TARGET_SIZES_REJECTED");
+                }
+                if (!Array.isArray(targets))
+                    throw new AppError("TARGET_SIZES_REJECTED");
+                const normalized = targets.map(value => { if (!value || typeof value !== "object")
+                    throw new AppError("TARGET_SIZES_REJECTED"); return { width: Number(value.width), height: Number(value.height), profile: value.profile }; });
+                return json(res, 201, await batchFlow.create(await body(req), normalized, idempotencyKey));
+            }
+            if (method === "POST" && url.pathname === "/api/batches/validate-target") {
+                if (!String(req.headers["content-type"] || "").startsWith("application/json"))
+                    throw new AppError("CONTENT_TYPE_REJECTED");
+                const value = JSON.parse((await body(req, 4096)).toString()), width = Number(value.width), height = Number(value.height), plan = planSize(width, height);
+                return json(res, 200, { width, height, route: plan.route, requestWidth: plan.requestWidth, requestHeight: plan.requestHeight, postprocess: plan.postprocess, verified: true });
+            }
+            const batch = url.pathname.match(/^\/api\/batches\/([0-9a-f-]+)(?:\/(items|confirmation|generate|stop|download\.zip))?$/i);
+            if (batch) {
+                const id = batch[1], action = batch[2];
+                if (method === "GET" && !action)
+                    return json(res, 200, batchFlow.get(id));
+                if (method === "GET" && action === "items")
+                    return json(res, 200, { items: batchFlow.items(id) });
+                if (method === "GET" && action === "confirmation") {
+                    if (!formalMode || cookie(req, "resize_session") !== session)
+                        throw new AppError("CONFIRMATION_UNAVAILABLE", "CONFIRMATION_UNAVAILABLE", 403);
+                    const requested = String(url.searchParams.get("action") || "START").toUpperCase();
+                    if (!["START", "RETRY", "SKIP"].includes(requested))
+                        throw new AppError("BATCH_ACTION_REJECTED");
+                    return json(res, 200, batchFlow.issue(id, requested, url.searchParams.get("jobId") || undefined));
+                }
+                if (method === "POST" && action === "generate") {
+                    if (!formalMode)
+                        throw new AppError("CONFIRMATION_UNAVAILABLE", "CONFIRMATION_UNAVAILABLE", 403);
+                    const value = JSON.parse((await body(req, 4096)).toString());
+                    return json(res, 202, batchFlow.submit(id, String(value.nonce || ""), value.confirmed === true));
+                }
+                if (method === "POST" && action === "stop")
+                    return json(res, 202, batchFlow.stop(id));
+                if (method === "GET" && action === "download.zip") {
+                    const data = await batchFlow.zip(id);
+                    res.statusCode = 200;
+                    res.setHeader("content-type", "application/zip");
+                    res.setHeader("content-disposition", `attachment; filename="resize-batch-${id}.zip"`);
+                    res.setHeader("content-length", String(data.length));
+                    return res.end(data);
+                }
+                if (method === "DELETE" && !action)
+                    return json(res, 200, await batchFlow.delete(id));
+            }
+            const job = url.pathname.match(/^\/api\/jobs\/([0-9a-f-]+)(?:\/(confirmation|generate|retry|stop|result|source|attempts))?$/i);
+            if (job) {
+                const id = job[1], action = job[2];
+                if (method === "GET" && !action)
+                    return json(res, 200, runtime.get(id));
+                if (method === "GET" && action === "confirmation") {
+                    if (!formalMode || cookie(req, "resize_session") !== session)
+                        throw new AppError("CONFIRMATION_UNAVAILABLE", "CONFIRMATION_UNAVAILABLE", 403);
+                    return json(res, 200, flow.issue(id));
+                }
+                if (method === "POST" && action === "generate") {
+                    if (keySetupOnly)
+                        throw new AppError("KEY_SETUP_ONLY", "KEY_SETUP_ONLY", 409);
+                    if (formalMode) {
+                        const value = JSON.parse((await body(req, 4096)).toString()), mode = productMode === "PRODUCTION_PREVIEW" && req.headers["x-fake-mode"] === "hang" ? "hang" : "success";
+                        return json(res, 202, await flow.submit(id, String(value.nonce || ""), value.confirmed === true, mode));
+                    }
+                    return json(res, 202, await runtime.start(id, req.headers["x-fake-mode"] === "hang" ? "hang" : "success"));
+                }
+                if (method === "POST" && action === "retry") {
+                    if (!formalMode)
+                        throw new AppError("RETRY_UNAVAILABLE");
+                    return json(res, 200, flow.retry(id));
+                }
+                if (method === "POST" && action === "stop")
+                    return json(res, 202, runtime.stop(id));
+                if (method === "GET" && action === "attempts")
+                    return json(res, 200, { attempts: flow.attempts(id) });
+                if (method === "GET" && action === "source") {
+                    const data = await runtime.source(id);
+                    res.statusCode = 200;
+                    res.setHeader("content-type", "image/png");
+                    res.setHeader("cache-control", "no-store");
+                    return res.end(data);
+                }
+                if (method === "GET" && action === "result") {
+                    const data = await runtime.result(id);
+                    res.statusCode = 200;
+                    res.setHeader("content-type", "image/png");
+                    res.setHeader("content-disposition", `attachment; filename="resize-${id}.png"`);
+                    return res.end(data);
+                }
+                if (method === "DELETE" && !action)
+                    return json(res, 200, await runtime.delete(id));
+            }
+            if (method === "POST" && url.pathname === "/api/shutdown") {
+                if (runtime.hasRunning())
+                    return json(res, 409, { error: "RUNNING_TASKS" });
+                json(res, 200, { status: "SHUTTING_DOWN" });
+                setImmediate(() => void options.onShutdown?.());
+                return;
+            }
+            if (method !== "GET" && method !== "HEAD")
+                throw new AppError("METHOD_NOT_ALLOWED", "METHOD_NOT_ALLOWED", 405);
+            const file = url.pathname === "/" ? "index.html" : url.pathname.startsWith("/assets/") ? url.pathname.slice(1) : "";
+            if (!file)
+                throw new AppError("NOT_FOUND", "NOT_FOUND", 404);
+            const data = await readFile(join(options.distDir, file));
+            res.statusCode = 200;
+            res.setHeader("content-type", extname(file) === ".html" ? "text/html; charset=utf-8" : extname(file) === ".css" ? "text/css" : "text/javascript");
+            if (file === "index.html")
+                res.setHeader("set-cookie", `resize_session=${session}; HttpOnly; SameSite=Strict; Path=/`);
+            res.end(method === "HEAD" ? undefined : data);
+        }
+        catch (e) {
+            json(res, e instanceof AppError ? e.httpStatus : 500, { error: safeDetail(e) });
+        }
+    });
+    return server;
+}

@@ -1,0 +1,12 @@
+#!/bin/zsh
+set -eu
+SCRIPT_DIR="${0:A:h}"
+cd "$SCRIPT_DIR"
+export RESIZE_REAL_PROVIDER_ENABLED=0
+export RESIZE_FAKE_MODE=1
+export RESIZE_RUN_MODE=DEMO
+export RESIZE_ENABLE_PRODUCTION_KEYCHAIN=0
+export RESIZE_PRODUCT_MODE=DEMO
+export RESIZE_DATA_NAMESPACE=DEMO
+export RESIZE_KEY_SETUP_ONLY=0
+exec /bin/zsh "$SCRIPT_DIR/scripts/launch-local.zsh"

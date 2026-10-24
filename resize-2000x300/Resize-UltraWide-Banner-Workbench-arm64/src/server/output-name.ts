@@ -1,0 +1,2 @@
+import type{TargetProfile}from"../shared/contracts.js";
+export function outputName(profile:TargetProfile,width:number,height:number){if(profile==="other"&&!(width===2000&&height===300))return`other-${width}x${height}${width===720&&height===1600?"-safe220":""}.png`;const model={aha:"gpt-image-2",mb:"gemini-flash-lite","ps-opening":"gemini-flash","ps-banner":"gemini-pro","ip-msg":"gpt-image-2",other:"model"}[profile];return`banner-${width}x${height}-${model}.png`}

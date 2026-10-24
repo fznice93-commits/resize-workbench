@@ -1,0 +1,1 @@
+{"extends":"./tsconfig.json","compilerOptions":{"noEmit":false,"outDir":"dist-server","rootDir":"src","jsx":"react-jsx"},"include":["src/server/**/*.ts","src/shared/**/*.ts"]}
