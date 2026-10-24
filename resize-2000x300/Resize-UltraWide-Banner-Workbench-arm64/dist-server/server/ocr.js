@@ -1,0 +1,91 @@
+import { spawn } from "node:child_process";
+import { access, mkdir, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { AppError } from "./errors.js";
+export const visionOcrBinary = () => resolve(process.env.RESIZE_VISION_OCR_BIN || "bin/vision-ocr");
+export async function assertVisionOcrAvailable() { try {
+    await access(visionOcrBinary(), constants.X_OK);
+}
+catch {
+    throw new AppError("OCR_VALIDATION_FAILED");
+} }
+async function recognizeFile(path, deadlineMs = 20_000) { await assertVisionOcrAvailable(); return new Promise((resolvePromise, reject) => { const child = spawn(visionOcrBinary(), [path], { stdio: ["ignore", "pipe", "ignore"] }); let output = "", settled = false; const finish = (error, value) => { if (settled)
+    return; settled = true; clearTimeout(timer); error ? reject(error) : resolvePromise(value || []); }; const timer = setTimeout(() => { child.kill("SIGKILL"); finish(new AppError("OCR_VALIDATION_FAILED")); }, deadlineMs); child.stdout.on("data", chunk => { output += String(chunk); if (output.length > 1_000_000) {
+    child.kill("SIGKILL");
+    finish(new AppError("OCR_VALIDATION_FAILED"));
+} }); child.once("error", () => finish(new AppError("OCR_VALIDATION_FAILED"))); child.once("exit", code => { if (settled)
+    return; if (code !== 0)
+    return finish(new AppError("OCR_VALIDATION_FAILED")); try {
+    const parsed = JSON.parse(output);
+    if (!Array.isArray(parsed))
+        throw new Error();
+    finish(undefined, parsed);
+}
+catch {
+    finish(new AppError("OCR_VALIDATION_FAILED"));
+} }); }); }
+export async function recognizeBuffer(buffer, tempPath) { await mkdir(dirname(tempPath), { recursive: true }); await writeFile(tempPath, buffer, { flag: "wx", mode: 0o600 }); try {
+    return await recognizeFile(tempPath);
+}
+finally {
+    await rm(tempPath, { force: true });
+} }
+const normalized = (value) => value.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().replace(/[’']/g, "'");
+const readable = (item, minHeight = .025, minConfidence = .35) => item.height >= minHeight && item.confidence >= minConfidence;
+const words = (value) => normalized(value).match(/[\p{L}\p{N}]+/gu)?.filter(value => /\p{L}/u.test(value) && value.length >= 4) ?? [];
+export function semanticWordCounts(observations, minHeight = .025, minConfidence = .35) { const counts = new Map(); for (const item of observations) {
+    if (!readable(item, minHeight, minConfidence))
+        continue;
+    for (const word of words(item.text))
+        counts.set(word, (counts.get(word) ?? 0) + 1);
+} return counts; }
+export function missingSemanticWords(source, output) { const expected = semanticWordCounts(source, .035, .4), actual = semanticWordCounts(output, .02, .3); return [...expected].filter(([word, count]) => (actual.get(word) ?? 0) < count).map(([word]) => word); }
+function editDistance(a, b) { const previous = Array.from({ length: b.length + 1 }, (_, index) => index); for (let i = 1; i <= a.length; i++) {
+    let diagonal = previous[0], left = i;
+    previous[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+        const above = previous[j], next = Math.min(above + 1, left + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+        diagonal = above;
+        previous[j] = next;
+        left = next;
+    }
+} return previous[b.length]; }
+function closestSource(word, source) { if (source.has(word))
+    return word; let best, bestDistance = Infinity; for (const candidate of source.keys()) {
+    if (Math.abs(candidate.length - word.length) > 2)
+        continue;
+    const distance = editDistance(word, candidate), limit = candidate.length >= 8 ? 2 : 1;
+    if (distance <= limit && distance < bestDistance) {
+        best = candidate;
+        bestDistance = distance;
+    }
+} return best; }
+export function duplicatedSemanticWords(source, output) { const expected = semanticWordCounts(source, .012, .2), raw = semanticWordCounts(output, .012, .2), actual = new Map(); for (const [word, count] of raw) {
+    const canonical = closestSource(word, expected);
+    if (canonical)
+        actual.set(canonical, (actual.get(canonical) ?? 0) + count);
+} return [...expected].filter(([word, count]) => (actual.get(word) ?? 0) > count).map(([word]) => word); }
+export function criticalTokens(observations) { const tokens = new Set(); for (const item of observations) {
+    if (item.height < 0.025 || item.confidence < 0.25 || item.confidence < 0.45 && item.height < 0.05)
+        continue;
+    const text = normalized(item.text);
+    for (const match of text.matchAll(/(?:https?:\/\/)?(?:www\.)?[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)+(?:\/[a-z0-9._~:/?#[\]@!$&'()*+,;=%-]*)?/gi)) {
+        const value = match[0].replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/[.,;:]+$/, "");
+        if (value.includes("."))
+            tokens.add(`url:${value}`);
+    }
+    for (const match of text.matchAll(/\d[\d\s,.'’]*\d|\d/g)) {
+        const digits = match[0].replace(/\D/g, "");
+        if (digits.length >= 2 || /%|mah|wh|w\b|gb|tb|hz|v\b/i.test(text))
+            tokens.add(`num:${digits}`);
+    }
+} return tokens; }
+export function missingCriticalTokens(source, output) { const expected = criticalTokens(source), actual = criticalTokens(output); return [...expected].filter(token => !actual.has(token)); }
+export function textConsistency(source, output) { return { missingCritical: missingCriticalTokens(source, output), missingWords: missingSemanticWords(source, output), duplicateWords: duplicatedSemanticWords(source, output) }; }
+export async function assertCriticalTextPreserved(source, output, tempBase) { const [sourceOCR, outputOCR] = await Promise.all([recognizeBuffer(source, `${tempBase}-source.png`), recognizeBuffer(output, `${tempBase}-output.png`)]), check = textConsistency(sourceOCR, outputOCR); if (check.missingCritical.length)
+    throw new AppError("CRITICAL_TEXT_MISMATCH"); if (check.missingWords.length)
+    throw new AppError("CRITICAL_TEXT_MISSING"); if (check.duplicateWords.length >= 2)
+    throw new AppError("CRITICAL_TEXT_DUPLICATED"); return { sourceCriticalCount: criticalTokens(sourceOCR).size, outputCriticalCount: criticalTokens(outputOCR).size, sourceSemanticCount: semanticWordCounts(sourceOCR).size, outputSemanticCount: semanticWordCounts(outputOCR).size }; }
+export const visionCriticalTextGate = { preflight: assertVisionOcrAvailable, compare: assertCriticalTextPreserved };
+export const disabledCriticalTextGate = { preflight: async () => { }, compare: async () => ({ sourceCriticalCount: 0, outputCriticalCount: 0 }) };

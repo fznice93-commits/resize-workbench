@@ -1,0 +1,33 @@
+import http from "node:http";
+import { BUILD_ID, POLICY, POLICY_HASH } from "../shared/policy.js";
+import { MemoryKeychain } from "./keychain.js";
+import { planSize } from "./size-plan.js";
+import { safeDetail } from "./errors.js";
+const keys = new MemoryKeychain();
+export async function handleApi(method, url, body = "") { try {
+    if (method === "GET" && url === "/api/health")
+        return { status: 200, body: { ok: true, buildId: BUILD_ID, policyHash: POLICY_HASH, promptGate: "PASS", host: POLICY.bindHost } };
+    if (method === "GET" && url === "/api/key-status")
+        return { status: 200, body: await keys.status() };
+    if (method === "POST" && url === "/api/plan") {
+        if (body.length > 4096)
+            throw new Error("too large");
+        const { width, height } = JSON.parse(body);
+        return { status: 200, body: planSize(width, height) };
+    }
+    if (method === "POST" && url === "/api/generate")
+        return { status: 409, body: { error: "REAL_PROVIDER_DISABLED", fakeOnly: true } };
+    return { status: 404, body: { error: "NOT_FOUND" } };
+}
+catch (e) {
+    return { status: 400, body: { error: safeDetail(e) } };
+} }
+export function createServer() { return http.createServer(async (req, res) => { res.setHeader("content-type", "application/json"); let raw = ""; for await (const c of req) {
+    raw += c;
+    if (raw.length > 4097)
+        break;
+} const result = await handleApi(req.method || "GET", req.url || "/", raw); res.statusCode = result.status; res.end(JSON.stringify(result.body)); }); }
+if (import.meta.url === `file://${process.argv[1]}`) {
+    const server = createServer();
+    server.listen(0, POLICY.bindHost, () => console.log(`Resize Product Workbench listening on 127.0.0.1:${server.address().port}; real provider disabled`));
+}
