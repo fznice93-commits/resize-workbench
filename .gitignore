@@ -1,0 +1,14 @@
+node_modules/
+__MACOSX/
+.DS_Store
+__pycache__/
+*.pyc
+本地数据/
+.env
+.env.*
+*.log
+*.sqlite*
+*.db
+*.zip
+*.pem
+*.key
